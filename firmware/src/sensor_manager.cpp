@@ -32,7 +32,7 @@ bool SensorManager::begin()
 
   if (!bmpReady_)
   {
-    Serial.println("Warning: BMP280 not detected, pressure will be reported as 0.0 hPa");
+    Serial.println("Warning: BMP280 not detected, uploads will be skipped until the sensor responds");
   }
 
   return true;
@@ -55,24 +55,30 @@ bool SensorManager::sample(SensorReading &outReading)
 
   if (isnan(humidity) || isnan(temperature))
   {
+    Serial.println("DHT read failed: temperature or humidity is NaN");
     return false;
   }
 
   if (humidity < 0.0f || humidity > 100.0f)
   {
+    Serial.printf("DHT read failed: humidity out of range %.2f%%\n", humidity);
     return false;
   }
 
-  float pressureHpa = 0.0f;
-
-  if (bmpReady_)
+  if (!bmpReady_)
   {
-    const float pressurePa = g_bmp.readPressure();
-    if (pressurePa > 0.0f)
-    {
-      pressureHpa = pressurePa / 100.0f;
-    }
+    Serial.println("BMP280 read failed: sensor not initialized");
+    return false;
   }
+
+  const float pressurePa = g_bmp.readPressure();
+  if (isnan(pressurePa) || pressurePa <= 0.0f)
+  {
+    Serial.printf("BMP280 read failed: invalid pressure %.2f Pa\n", pressurePa);
+    return false;
+  }
+
+  const float pressureHpa = pressurePa / 100.0f;
 
   uint8_t rainHits = 0;
   for (uint8_t i = 0; i < RAIN_SAMPLE_COUNT; ++i)

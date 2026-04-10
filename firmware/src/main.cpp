@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
+#include <WiFi.h>
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
 
@@ -16,6 +18,8 @@ namespace
   constexpr uint8_t LCD_ROWS = 2;
   constexpr unsigned long SENSOR_POLL_INTERVAL_MS = 2500;
   constexpr unsigned long STATUS_LOG_INTERVAL_MS = 10000;
+  constexpr uint32_t LOOP_WATCHDOG_TIMEOUT_SECONDS = 10;
+  constexpr unsigned long HEAP_LOG_INTERVAL_MS = 60UL * 60UL * 1000UL;
 
   SensorManager g_sensorManager;
   WiFiManager g_wifiManager;
@@ -27,11 +31,13 @@ namespace
   unsigned long g_lastUploadMs = 0;
   unsigned long g_lastClockWaitLogMs = 0;
   unsigned long g_lastHealthLogMs = 0;
+  unsigned long g_lastHeapLogMs = 0;
   unsigned long g_lastRecoveryActionMs = 0;
   char g_lastLcdLines[LCD_ROWS][LCD_COLUMNS + 1] = {};
   RTC_DATA_ATTR uint32_t g_bootCount = 0;
   RTC_DATA_ATTR uint32_t g_softwareRestartCount = 0;
   bool g_restartEscalationDisabled = false;
+  bool g_hasValidReading = false;
 
   const char *resetReasonToString(esp_reset_reason_t reason)
   {
@@ -128,11 +134,13 @@ namespace
     SensorReading reading{};
     if (!g_sensorManager.sample(reading))
     {
+      g_hasValidReading = false;
       renderStatusOnLcd("Sensor sample", "failed");
       return false;
     }
 
     g_latestReading = reading;
+    g_hasValidReading = true;
     renderReadingOnLcd(g_latestReading);
     return true;
   }
@@ -143,6 +151,25 @@ namespace
     g_uploader.begin();
     g_sensorManager.setTimestampProvider(currentUnixTimeProvider);
     g_sensorManager.begin();
+  }
+
+  void initializeWatchdog()
+  {
+    const esp_err_t initResult = esp_task_wdt_init(LOOP_WATCHDOG_TIMEOUT_SECONDS, true);
+    if (initResult != ESP_OK && initResult != ESP_ERR_INVALID_STATE)
+    {
+      Serial.printf("Task watchdog init failed: %d\n", static_cast<int>(initResult));
+      return;
+    }
+
+    const esp_err_t addResult = esp_task_wdt_add(nullptr);
+    if (addResult != ESP_OK && addResult != ESP_ERR_INVALID_ARG)
+    {
+      Serial.printf("Task watchdog add failed: %d\n", static_cast<int>(addResult));
+      return;
+    }
+
+    Serial.printf("Task watchdog enabled: %u seconds\n", static_cast<unsigned>(LOOP_WATCHDOG_TIMEOUT_SECONDS));
   }
 
   void renderConnectivityStatus()
@@ -157,7 +184,7 @@ namespace
     }
   }
 
-  void queueLatestReadingForUpload(unsigned long nowMs)
+  void handlePeriodicUpload(unsigned long nowMs)
   {
     if (nowMs - g_lastUploadMs < config::UPLOAD_INTERVAL_MS)
     {
@@ -165,6 +192,12 @@ namespace
     }
 
     g_lastUploadMs = nowMs;
+
+    if (!g_hasValidReading)
+    {
+      Serial.println("Upload skipped: latest sensor reading is invalid");
+      return;
+    }
 
     if (!g_wifiManager.timeReady())
     {
@@ -206,10 +239,20 @@ namespace
     if (!sampleSensors())
     {
       Serial.println("Sensor sample failed");
+    }
+  }
+
+  void logHeapUsage(unsigned long nowMs)
+  {
+    if (g_lastHeapLogMs != 0 && nowMs - g_lastHeapLogMs < HEAP_LOG_INTERVAL_MS)
+    {
       return;
     }
 
-    queueLatestReadingForUpload(nowMs);
+    g_lastHeapLogMs = nowMs;
+    Serial.printf("Heap check: free=%u min=%u\n",
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(ESP.getMinFreeHeap()));
   }
 
   void logHealth(unsigned long nowMs)
@@ -304,6 +347,7 @@ void setup()
 
   initializeDisplay();
   g_ledManager.begin();
+  initializeWatchdog();
 
   initializeSubsystems();
   if (!g_sensorManager.pressureAvailable())
@@ -331,10 +375,12 @@ void loop()
   g_uploader.update(nowMs, g_wifiManager.isConnected(), g_wifiManager.timeReady());
   renderConnectivityStatus();
   handlePeriodicSampling(nowMs);
+  handlePeriodicUpload(nowMs);
 
   logHealth(nowMs);
+  logHeapUsage(nowMs);
   recoverIfSystemStalled(nowMs);
 
-  // Keep the main loop watchdog-friendly without changing the existing schedule.
+  esp_task_wdt_reset();
   yield();
 }

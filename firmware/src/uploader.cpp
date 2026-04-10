@@ -1,7 +1,47 @@
 #include "uploader.h"
 
+#include <time.h>
+
 namespace
 {
+  constexpr size_t kFirebasePathBufferSize = 128;
+
+  bool usesUnixMilliseconds(uint64_t timestamp)
+  {
+    return timestamp >= 1000000000000ULL;
+  }
+
+  bool getFormattedDate(uint64_t timestamp, char *dateBuffer, size_t dateBufferSize)
+  {
+    const time_t unixTimeSeconds = static_cast<time_t>(usesUnixMilliseconds(timestamp) ? (timestamp / 1000ULL) : timestamp);
+    if (unixTimeSeconds <= 0)
+    {
+      return false;
+    }
+
+    struct tm timeInfo;
+    if (gmtime_r(&unixTimeSeconds, &timeInfo) == nullptr)
+    {
+      return false;
+    }
+
+    return strftime(dateBuffer, dateBufferSize, "%Y-%m-%d", &timeInfo) > 0;
+  }
+
+  uint64_t getUniqueReadingPathTimestamp(uint64_t timestamp)
+  {
+    static uint64_t lastReadingPathTimestamp = 0ULL;
+
+    uint64_t pathTimestamp = usesUnixMilliseconds(timestamp) ? timestamp : (timestamp * 1000ULL);
+    if (pathTimestamp <= lastReadingPathTimestamp)
+    {
+      pathTimestamp = lastReadingPathTimestamp + 1ULL;
+    }
+
+    lastReadingPathTimestamp = pathTimestamp;
+    return pathTimestamp;
+  }
+
   unsigned long nextBackoffDelay(unsigned long currentDelay, unsigned long maxDelay)
   {
     if (currentDelay >= maxDelay / 2UL)
@@ -12,13 +52,10 @@ namespace
     return currentDelay * 2UL;
   }
 
-  void buildStationBasePath(String &path)
+  bool buildStationBasePath(char *path, size_t pathSize)
   {
-    // Rebuild the shared station root in one place to avoid duplicated path logic.
-    path.reserve(sizeof(config::FIREBASE_ROOT_PATH) + sizeof(STATION_ID));
-    path = config::FIREBASE_ROOT_PATH;
-    path += "/";
-    path += STATION_ID;
+    const int written = snprintf(path, pathSize, "%s/%s", config::FIREBASE_ROOT_PATH, STATION_ID);
+    return written > 0 && static_cast<size_t>(written) < pathSize;
   }
 
   bool ensureStationInfo(FirebaseData &fbdo)
@@ -30,21 +67,27 @@ namespace
       return true;
     }
 
-    // Build once from the shared base path so station metadata always lands under
-    // /weather_stations/{STATION_ID}/info.
-    String infoPath;
-    // Reserve path capacity up front to reduce heap churn over long runtimes.
-    infoPath.reserve(sizeof(config::FIREBASE_ROOT_PATH) + sizeof(STATION_ID) + sizeof(config::FIREBASE_INFO_SUFFIX));
-    buildStationBasePath(infoPath);
-    infoPath += config::FIREBASE_INFO_SUFFIX;
+    char infoPath[kFirebasePathBufferSize];
+    if (!buildStationBasePath(infoPath, sizeof(infoPath)))
+    {
+      Serial.println("Firebase station info path is too long");
+      return false;
+    }
 
-    if (Firebase.RTDB.pathExisted(&fbdo, infoPath.c_str()))
+    const size_t baseLength = strlen(infoPath);
+    const int suffixWritten = snprintf(infoPath + baseLength, sizeof(infoPath) - baseLength, "%s", config::FIREBASE_INFO_SUFFIX);
+    if (suffixWritten <= 0 || static_cast<size_t>(suffixWritten) >= sizeof(infoPath) - baseLength)
+    {
+      Serial.println("Firebase station info path suffix is too long");
+      return false;
+    }
+
+    if (Firebase.RTDB.pathExisted(&fbdo, infoPath))
     {
       stationInfoInitialized = true;
       return true;
     }
 
-    // Only create metadata when the node is genuinely absent.
     if (fbdo.httpCode() != FIREBASE_ERROR_PATH_NOT_EXIST)
     {
       Serial.printf("Firebase station info check failed: %s\n", fbdo.errorReason().c_str());
@@ -55,10 +98,10 @@ namespace
     infoJson.set("name", STATION_ID);
     infoJson.set("location", STATION_LOCATION);
 
-    if (Firebase.RTDB.setJSON(&fbdo, infoPath.c_str(), &infoJson))
+    if (Firebase.RTDB.setJSON(&fbdo, infoPath, &infoJson))
     {
       stationInfoInitialized = true;
-      Serial.printf("Firebase station info initialized: %s\n", infoPath.c_str());
+      Serial.printf("Firebase station info initialized: %s\n", infoPath);
       return true;
     }
 
@@ -487,40 +530,64 @@ bool Uploader::ensureFirebaseReady_(unsigned long nowMs)
 
 bool Uploader::uploadReading_(const SensorReading &reading, unsigned long nowMs)
 {
-  char timestampBuffer[24];
-  snprintf(timestampBuffer, sizeof(timestampBuffer), "%llu", static_cast<unsigned long long>(reading.timestamp));
+  char latestPath[kFirebasePathBufferSize];
+  if (!buildStationBasePath(latestPath, sizeof(latestPath)))
+  {
+    Serial.println("Firebase upload path is too long");
+    return false;
+  }
 
-  // Route writes into a per-station namespace so multiple ESP32 nodes can
-  // share one Firebase database without overwriting each other.
-  String basePath;
-  buildStationBasePath(basePath);
+  char readingsPath[kFirebasePathBufferSize];
+  memcpy(readingsPath, latestPath, sizeof(latestPath));
 
-  // Reuse the shared base path and append suffixes incrementally to avoid
-  // ambiguous operator+ chains and extra temporary Strings.
-  String latestPath = basePath;
-  // Reserve once to avoid extra reallocations in the long-running uploader task.
-  latestPath.reserve(basePath.length() + sizeof(config::FIREBASE_LATEST_SUFFIX));
-  latestPath += config::FIREBASE_LATEST_SUFFIX;
+  const uint64_t readingPathTimestamp = getUniqueReadingPathTimestamp(reading.timestamp);
+  char formattedDate[11];
+  if (!getFormattedDate(readingPathTimestamp, formattedDate, sizeof(formattedDate)))
+  {
+    Serial.println("Firebase reading date format failed");
+    return false;
+  }
 
-  String historyPath = basePath;
-  historyPath.reserve(basePath.length() + sizeof(config::FIREBASE_HISTORY_SUFFIX) + sizeof(timestampBuffer));
-  historyPath += config::FIREBASE_HISTORY_SUFFIX;
-  historyPath += timestampBuffer;
+  const size_t latestBaseLength = strlen(latestPath);
+  const int latestSuffixWritten = snprintf(latestPath + latestBaseLength, sizeof(latestPath) - latestBaseLength, "%s", config::FIREBASE_LATEST_SUFFIX);
+  if (latestSuffixWritten <= 0 || static_cast<size_t>(latestSuffixWritten) >= sizeof(latestPath) - latestBaseLength)
+  {
+    Serial.println("Firebase latest path is too long");
+    return false;
+  }
 
-  FirebaseJson json;
-  json.set("deviceId", DEVICE_ID);
-  json.set("timestamp", static_cast<double>(reading.timestamp));
-  json.set("temperature", reading.temperatureC);
-  json.set("humidity", reading.humidityPct);
-  json.set("rain", reading.isRaining ? 1 : 0);
-  json.set("pressure", reading.pressureHpa);
+  const size_t readingsBaseLength = strlen(readingsPath);
+  const int readingsSuffixWritten = snprintf(
+      readingsPath + readingsBaseLength,
+      sizeof(readingsPath) - readingsBaseLength,
+      "%s%s/%llu",
+      config::FIREBASE_READINGS_SUFFIX,
+      formattedDate,
+      static_cast<unsigned long long>(readingPathTimestamp));
+  if (readingsSuffixWritten <= 0 || static_cast<size_t>(readingsSuffixWritten) >= sizeof(readingsPath) - readingsBaseLength)
+  {
+    Serial.println("Firebase readings path is too long");
+    return false;
+  }
 
-  // Optional station metadata is initialized once and then left untouched.
+  FirebaseJson latestJson;
+  latestJson.set("deviceId", DEVICE_ID);
+  latestJson.set("timestamp", static_cast<double>(reading.timestamp));
+  latestJson.set("temperature", reading.temperatureC);
+  latestJson.set("humidity", reading.humidityPct);
+  latestJson.set("rain", reading.isRaining ? 1 : 0);
+  latestJson.set("pressure", reading.pressureHpa);
+
+  FirebaseJson readingJson;
+  readingJson.set("temperature", reading.temperatureC);
+  readingJson.set("humidity", reading.humidityPct);
+  readingJson.set("pressure", reading.pressureHpa);
+  readingJson.set("rain", reading.isRaining ? 1 : 0);
+  readingJson.set("timestamp", static_cast<double>(reading.timestamp));
+
   (void)ensureStationInfo(fbdo_);
 
-  // Keep the existing payload unchanged while writing both the current
-  // snapshot and the timestamped history entry.
-  if (!Firebase.RTDB.setJSON(&fbdo_, latestPath.c_str(), &json))
+  if (!Firebase.RTDB.setJSON(&fbdo_, latestPath, &latestJson))
   {
     Serial.printf(
         "Firebase latest upload failed: %s (ts=%llu, at=%lu ms)\n",
@@ -530,10 +597,10 @@ bool Uploader::uploadReading_(const SensorReading &reading, unsigned long nowMs)
     return false;
   }
 
-  if (!Firebase.RTDB.setJSON(&fbdo_, historyPath.c_str(), &json))
+  if (!Firebase.RTDB.setJSON(&fbdo_, readingsPath, &readingJson))
   {
     Serial.printf(
-        "Firebase history upload failed: %s (ts=%llu, at=%lu ms)\n",
+        "Firebase readings upload failed: %s (ts=%llu, at=%lu ms)\n",
         fbdo_.errorReason().c_str(),
         static_cast<unsigned long long>(reading.timestamp),
         static_cast<unsigned long>(nowMs));

@@ -113,6 +113,7 @@ void WiFiManager::forceReconnect()
 {
   WiFi.disconnect(false, false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  yield();
   lastConnectAttemptMs_ = millis();
   if (disconnectedSinceMs_ == 0)
   {

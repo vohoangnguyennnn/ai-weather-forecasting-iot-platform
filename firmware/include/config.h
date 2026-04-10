@@ -4,11 +4,11 @@
 #include <Arduino.h>
 
 #ifndef WIFI_SSID
-#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_SSID "QuocQuang"
 #endif
 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_PASSWORD "21112005"
 #endif
 
 // Station ID selects the Firebase namespace for this physical device.
@@ -27,11 +27,11 @@
 #endif
 
 #ifndef API_KEY
-#define API_KEY "YOUR_FIREBASE_API_KEY"
+#define API_KEY "AIzaSyBuot6MSqGdTXu19kEMfONUvIpid323Fj4"
 #endif
 
 #ifndef DATABASE_URL
-#define DATABASE_URL "HTTP_OR_HTTPS_URL_OF_YOUR_FIREBASE_REALTIME_DATABASE"
+#define DATABASE_URL "https://aiotnhom2-default-rtdb.firebaseio.com/"
 #endif
 
 #ifndef DHT_GPIO
@@ -60,10 +60,10 @@ namespace config
   constexpr char FIREBASE_ROOT_PATH[] = "/weather_stations";
   constexpr char FIREBASE_INFO_SUFFIX[] = "/info";
   constexpr char FIREBASE_LATEST_SUFFIX[] = "/latest";
-  constexpr char FIREBASE_HISTORY_SUFFIX[] = "/history/";
+  constexpr char FIREBASE_READINGS_SUFFIX[] = "/readings/";
 
-  constexpr unsigned long UPLOAD_INTERVAL_MS = 10000;
-  constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
+  constexpr unsigned long UPLOAD_INTERVAL_MS = 60000;
+  constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 5000;
   constexpr unsigned long FIREBASE_RETRY_INTERVAL_MS = 5000;
   constexpr unsigned long FIREBASE_INIT_RETRY_MAX_MS = 60000;
   constexpr unsigned long FIREBASE_UPLOAD_RETRY_INITIAL_MS = 2000;
